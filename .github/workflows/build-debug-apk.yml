@@ -290,11 +290,19 @@ jobs:
         with:
           name: local-dream-debug-${{ github.sha }}
           path:  |
-            app/build/outputs/apk/**/*.apk
+            app/build/outputs/apk/basic/debug/*.apk
           if-no-files-found: error
-          retention-days: 30
+          retention-days: 7
 
-      # ── 12. Build summary ──────────────────────────────────────────────────
+
+      # ── 12. Check artifacts ───────────────────────────────────────────────
+      - name: Show generated APKs
+        run: |
+          echo "APK files:"
+          find app/build/outputs/apk -type f -name "*.apk"
+          
+
+      # ── 13. Build summary ──────────────────────────────────────────────────
       - name: Write build summary
         if: always()
         run: |
