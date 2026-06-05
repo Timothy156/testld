@@ -5,9 +5,8 @@ on:
     branches: [ master, main ]
   pull_request:
     branches: [ master, main ]
-  workflow_dispatch:          # allows manual triggering from the Actions tab
+  workflow_dispatch:
 
-# Cancel any in-progress run on the same branch so pushes don't queue up
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
@@ -15,6 +14,8 @@ concurrency:
 env:
   QNN_SDK_VERSION: "v2.28.0.241029"
   QNN_SDK_URL: "https://apigwx-aws.qualcomm.com/qsc/public/v1/api/download/software/qualcomm_neural_processing_sdk/v2.28.0.241029.zip"
+  # Pinned to 3.28.x — CMake 3.31 introduced CMP0175 which breaks tokenizers-cpp
+  CMAKE_PINNED_VERSION: "3.28.6"
   RUST_VERSION: "1.84.0"
   NDK_VERSION: "r27c"
   JAVA_VERSION: "17"
@@ -25,14 +26,14 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      # ── 1. Source ────────────────────────────────────────────────────────────
+      # ── 1. Source ──────────────────────────────────────────────────────────
       - name: Checkout repository (with submodules)
         uses: actions/checkout@v4
         with:
           submodules: recursive
           fetch-depth: 0
 
-      # ── 2. Java ──────────────────────────────────────────────────────────────
+      # ── 2. Java ────────────────────────────────────────────────────────────
       - name: Set up JDK ${{ env.JAVA_VERSION }}
         uses: actions/setup-java@v4
         with:
@@ -40,14 +41,14 @@ jobs:
           distribution: temurin
           cache: gradle
 
-      # ── 3. Rust ──────────────────────────────────────────────────────────────
+      # ── 3. Rust ────────────────────────────────────────────────────────────
       - name: Set up Rust ${{ env.RUST_VERSION }}
         uses: dtolnay/rust-toolchain@master
         with:
           toolchain: ${{ env.RUST_VERSION }}
           targets: aarch64-linux-android
 
-      - name: Cache Rust build artifacts
+      - name: Cache Rust artifacts
         uses: actions/cache@v4
         with:
           path: |
@@ -58,17 +59,35 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-rust-${{ env.RUST_VERSION }}-
 
-      # ── 4. System build tools ────────────────────────────────────────────────
-      - name: Install system dependencies (CMake, Ninja, unzip)
+      # ── 4. System build tools ──────────────────────────────────────────────
+      # NOTE: We install cmake from cmake.org at a pinned version (3.28.x).
+      # The cmake bundled with ubuntu-latest is 3.31+ which introduced CMP0175,
+      # a policy that breaks tokenizers-cpp's use of POST_BUILD in
+      # add_custom_command(OUTPUT …). cmake 3.28 predates that policy entirely.
+      - name: Install system dependencies (Ninja, unzip, dos2unix)
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y --no-install-recommends \
             ninja-build \
-            cmake \
             unzip \
-            wget
+            wget \
+            dos2unix \
+            python3
 
-      # ── 5. Android NDK ───────────────────────────────────────────────────────
+      - name: Install pinned CMake ${{ env.CMAKE_PINNED_VERSION }}
+        run: |
+          CMAKE_VER="${{ env.CMAKE_PINNED_VERSION }}"
+          wget -q \
+            "https://github.com/Kitware/CMake/releases/download/v${CMAKE_VER}/cmake-${CMAKE_VER}-linux-x86_64.tar.gz" \
+            -O /tmp/cmake-pinned.tar.gz
+          sudo tar -xzf /tmp/cmake-pinned.tar.gz -C /opt/
+          # Prepend pinned cmake bin directory so it shadows the system cmake
+          echo "/opt/cmake-${CMAKE_VER}-linux-x86_64/bin" >> "$GITHUB_PATH"
+
+      - name: Verify CMake version
+        run: cmake --version
+
+      # ── 5. Android NDK ────────────────────────────────────────────────────
       - name: Set up Android NDK ${{ env.NDK_VERSION }}
         id: setup-ndk
         uses: nttld/setup-ndk@v1
@@ -76,7 +95,7 @@ jobs:
           ndk-version: ${{ env.NDK_VERSION }}
           local-cache: true
 
-      # ── 6. QNN SDK ───────────────────────────────────────────────────────────
+      # ── 6. QNN SDK ────────────────────────────────────────────────────────
       - name: Cache QNN SDK
         id: cache-qnn
         uses: actions/cache@v4
@@ -94,78 +113,134 @@ jobs:
                "${{ env.QNN_SDK_URL }}" \
                -O qnn_sdk.zip
 
-          echo "Extracting QNN SDK ..."
+          echo "Extracting ..."
           mkdir -p qnn_sdk
           unzip -q qnn_sdk.zip -d qnn_sdk
           rm -f qnn_sdk.zip
 
       - name: Resolve QNN SDK root directory
         run: |
-          # The zip may contain a top-level versioned folder; resolve the real root
-          # by looking for the directory that contains 'lib' or 'include'
+          # Walk the extracted tree to find the directory that owns 'lib' or 'include'
           QNN_ROOT=$(find "${{ github.workspace }}/qnn_sdk" \
-                     -maxdepth 3 \
+                     -maxdepth 4 \
                      \( -name "lib" -o -name "include" \) \
                      -type d \
-                     | head -1 | xargs dirname)
+                     | head -1 | xargs dirname 2>/dev/null || true)
 
           if [ -z "$QNN_ROOT" ]; then
-            echo "ERROR: Could not determine QNN SDK root. Directory listing:"
-            find "${{ github.workspace }}/qnn_sdk" -maxdepth 3
+            echo "ERROR: Could not determine QNN SDK root. Listing tree:"
+            find "${{ github.workspace }}/qnn_sdk" -maxdepth 4 | head -60
             exit 1
           fi
 
-          echo "Resolved QNN SDK root: $QNN_ROOT"
+          echo "QNN SDK root resolved to: $QNN_ROOT"
           echo "QNN_SDK_ROOT=$QNN_ROOT" >> "$GITHUB_ENV"
 
-      # ── 7. Patch build config files ──────────────────────────────────────────
-      - name: Patch QNN_SDK_ROOT in CMakeLists.txt
+      # ── 7. Export build env vars ───────────────────────────────────────────
+      # build.sh may read these directly from the environment, so we export
+      # them here in addition to patching the config files below.
+      - name: Export SDK paths as environment variables
         run: |
-          CMAKE_FILE="app/src/main/cpp/CMakeLists.txt"
           NDK_PATH="${{ steps.setup-ndk.outputs.ndk-path }}"
+          echo "ANDROID_NDK_ROOT=${NDK_PATH}"  >> "$GITHUB_ENV"
+          echo "ANDROID_NDK=${NDK_PATH}"        >> "$GITHUB_ENV"
+          echo "QNN_SDK_ROOT=${{ env.QNN_SDK_ROOT }}" >> "$GITHUB_ENV"
 
-          echo "--- before patch (QNN_SDK_ROOT lines) ---"
-          grep -n "QNN_SDK_ROOT" "$CMAKE_FILE" || true
-
-          # Replace any existing set(QNN_SDK_ROOT ...) value
-          sed -i \
-            "s|set(QNN_SDK_ROOT[[:space:]]*\"[^\"]*\")|set(QNN_SDK_ROOT \"${{ env.QNN_SDK_ROOT }}\")|g" \
-            "$CMAKE_FILE"
-
-          # Fallback: if the line uses a bare path without quotes
-          sed -i \
-            "s|set(QNN_SDK_ROOT[[:space:]]*[^)]*)|set(QNN_SDK_ROOT \"${{ env.QNN_SDK_ROOT }}\")|g" \
-            "$CMAKE_FILE"
-
-          echo "--- after patch ---"
-          grep -n "QNN_SDK_ROOT" "$CMAKE_FILE" || true
-
-      - name: Patch ANDROID_NDK_ROOT in CMakePresets.json
+      # ── 8. Patch config files ──────────────────────────────────────────────
+      - name: Patch QNN_SDK_ROOT and ANDROID_NDK_ROOT into config files (Python)
         run: |
-          PRESETS_FILE="app/src/main/cpp/CMakePresets.json"
-          NDK_PATH="${{ steps.setup-ndk.outputs.ndk-path }}"
+          python3 - << 'PYEOF'
+          import re, json, pathlib, os, sys
 
-          echo "--- before patch (ANDROID_NDK_ROOT lines) ---"
-          grep -n "ANDROID_NDK_ROOT" "$PRESETS_FILE" || true
+          qnn_root = os.environ["QNN_SDK_ROOT"]
+          ndk_root = os.environ["ANDROID_NDK_ROOT"]
 
-          # Replace the NDK path (handles both quoted-value and path formats)
-          sed -i \
-            "s|\"ANDROID_NDK_ROOT\":[[:space:]]*\"[^\"]*\"|\"ANDROID_NDK_ROOT\": \"${NDK_PATH}\"|g" \
-            "$PRESETS_FILE"
+          # ── CMakeLists.txt ──────────────────────────────────────────────────
+          cmake_file = pathlib.Path("app/src/main/cpp/CMakeLists.txt")
+          if cmake_file.exists():
+              text = cmake_file.read_text()
+              original = text
 
-          echo "--- after patch ---"
-          grep -n "ANDROID_NDK_ROOT" "$PRESETS_FILE" || true
+              # Replace any set(QNN_SDK_ROOT ...) regardless of quoting style
+              text = re.sub(
+                  r'set\s*\(\s*QNN_SDK_ROOT\s+[^)]+\)',
+                  f'set(QNN_SDK_ROOT "{qnn_root}")',
+                  text
+              )
+              cmake_file.write_text(text)
+              changed = text != original
+              print(f"CMakeLists.txt: {'patched' if changed else 'pattern not found — check manually'}")
+              # Show context around QNN_SDK_ROOT lines for verification
+              for i, line in enumerate(text.splitlines(), 1):
+                  if "QNN_SDK_ROOT" in line:
+                      print(f"  line {i}: {line.strip()}")
+          else:
+              print("WARNING: CMakeLists.txt not found", file=sys.stderr)
 
-      # ── 8. Build native C++ libraries ────────────────────────────────────────
+          # ── CMakePresets.json ───────────────────────────────────────────────
+          presets_file = pathlib.Path("app/src/main/cpp/CMakePresets.json")
+          if presets_file.exists():
+              text = presets_file.read_text()
+              original = text
+              text = re.sub(
+                  r'"ANDROID_NDK_ROOT"\s*:\s*"[^"]*"',
+                  f'"ANDROID_NDK_ROOT": "{ndk_root}"',
+                  text
+              )
+              presets_file.write_text(text)
+              changed = text != original
+              print(f"CMakePresets.json: {'patched' if changed else 'pattern not found — check manually'}")
+              for i, line in enumerate(text.splitlines(), 1):
+                  if "ANDROID_NDK_ROOT" in line:
+                      print(f"  line {i}: {line.strip()}")
+          else:
+              print("WARNING: CMakePresets.json not found", file=sys.stderr)
+          PYEOF
+
+      # ── 9. Apply cmake compatibility shim to build.sh ─────────────────────
+      # Mirrors the macOS workaround documented in the README.
+      # Adds -DCMAKE_POLICY_VERSION_MINIMUM=3.5 to every cmake invocation
+      # inside build.sh so that third-party CMakeLists with old minimum
+      # versions don't spam deprecation errors or trigger strict policies.
+      - name: Patch build.sh for cmake policy compatibility
+        run: |
+          BUILD_SH="app/src/main/cpp/build.sh"
+          if [ -f "$BUILD_SH" ]; then
+            # Append the policy flag to every 'cmake ' call (same sed as macOS fix but Linux syntax)
+            sed -i 's/cmake \([^-]\)/cmake -DCMAKE_POLICY_VERSION_MINIMUM=3.5 \1/g' "$BUILD_SH"
+            echo "build.sh patched. cmake invocations now:"
+            grep "cmake " "$BUILD_SH" | head -10
+          else
+            echo "WARNING: build.sh not found at $BUILD_SH"
+          fi
+
+      # ── 10. Build native C++ libraries ─────────────────────────────────────
       - name: Build native libraries (build.sh)
         working-directory: app/src/main/cpp
+        env:
+          QNN_SDK_ROOT: ${{ env.QNN_SDK_ROOT }}
+          ANDROID_NDK_ROOT: ${{ env.ANDROID_NDK_ROOT }}
+          ANDROID_NDK: ${{ env.ANDROID_NDK_ROOT }}
         run: |
           chmod +x build.sh
+          # -Wno-dev suppresses cmake developer warnings (CMP0175, etc.)
+          # so they don't pollute CI output; real errors still surface.
+          export CMAKE_ARGS="-Wno-dev"
           bash ./build.sh
 
-      # ── 9. Gradle – build debug APK ──────────────────────────────────────────
+      # ── 11. Build Debug APK ─────────────────────────────────────────────────
       - name: Grant Gradle wrapper execute permission
         run: chmod +x gradlew
+
+      - name: Cache Gradle packages
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: ${{ runner.os }}-gradle-${{ hashFiles('**/*.gradle*', '**/gradle-wrapper.properties') }}
+          restore-keys: |
+            ${{ runner.os }}-gradle-
 
       - name: Build Debug APK
         run: |
@@ -174,13 +249,13 @@ jobs:
             --stacktrace \
             -Dorg.gradle.jvmargs="-Xmx4g -XX:MaxMetaspaceSize=512m"
 
-      # ── 10. Collect and upload artifacts ─────────────────────────────────────
+      # ── 12. Upload artifacts ────────────────────────────────────────────────
       - name: Locate APK files
         id: locate-apk
         run: |
           APK_DIR="app/build/outputs/apk/debug"
-          echo "APK files found:"
-          find "$APK_DIR" -name "*.apk" 2>/dev/null || echo "  (none)"
+          echo "APK files produced:"
+          find "$APK_DIR" -name "*.apk" 2>/dev/null || echo "  (none yet)"
           echo "apk_dir=$APK_DIR" >> "$GITHUB_OUTPUT"
 
       - name: Upload Debug APK(s)
@@ -191,22 +266,24 @@ jobs:
           if-no-files-found: error
           retention-days: 30
 
-      # ── 11. (Optional) Print build summary ───────────────────────────────────
-      - name: Print build summary
+      # ── 13. Build summary ──────────────────────────────────────────────────
+      - name: Write build summary
         if: always()
         run: |
           echo "## Build Summary" >> "$GITHUB_STEP_SUMMARY"
-          echo "| Property | Value |" >> "$GITHUB_STEP_SUMMARY"
-          echo "| --- | --- |" >> "$GITHUB_STEP_SUMMARY"
-          echo "| Commit | \`${{ github.sha }}\` |" >> "$GITHUB_STEP_SUMMARY"
-          echo "| Branch | \`${{ github.ref_name }}\` |" >> "$GITHUB_STEP_SUMMARY"
-          echo "| QNN SDK | \`${{ env.QNN_SDK_VERSION }}\` |" >> "$GITHUB_STEP_SUMMARY"
-          echo "| NDK | \`${{ env.NDK_VERSION }}\` |" >> "$GITHUB_STEP_SUMMARY"
-          echo "| Rust | \`${{ env.RUST_VERSION }}\` |" >> "$GITHUB_STEP_SUMMARY"
-          echo "" >> "$GITHUB_STEP_SUMMARY"
-          echo "### APK outputs" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Property | Value |"                                          >> "$GITHUB_STEP_SUMMARY"
+          echo "| --- | --- |"                                                 >> "$GITHUB_STEP_SUMMARY"
+          echo "| Commit | \`${{ github.sha }}\` |"                           >> "$GITHUB_STEP_SUMMARY"
+          echo "| Branch | \`${{ github.ref_name }}\` |"                      >> "$GITHUB_STEP_SUMMARY"
+          echo "| CMake | \`${{ env.CMAKE_PINNED_VERSION }}\` (pinned) |"     >> "$GITHUB_STEP_SUMMARY"
+          echo "| QNN SDK | \`${{ env.QNN_SDK_VERSION }}\` |"                 >> "$GITHUB_STEP_SUMMARY"
+          echo "| NDK | \`${{ env.NDK_VERSION }}\` |"                         >> "$GITHUB_STEP_SUMMARY"
+          echo "| Rust | \`${{ env.RUST_VERSION }}\` |"                       >> "$GITHUB_STEP_SUMMARY"
+          echo ""                                                              >> "$GITHUB_STEP_SUMMARY"
+          echo "### APK outputs"                                               >> "$GITHUB_STEP_SUMMARY"
           find app/build/outputs/apk -name "*.apk" 2>/dev/null \
-            | while read f; do
+            | while read -r f; do
                 size=$(du -h "$f" | cut -f1)
-                echo "- \`$(basename $f)\` ($size)" >> "$GITHUB_STEP_SUMMARY"
-              done || echo "_No APKs found_" >> "$GITHUB_STEP_SUMMARY"
+                echo "- \`$(basename "$f")\` (${size})" >> "$GITHUB_STEP_SUMMARY"
+              done \
+            || echo "_No APKs found_" >> "$GITHUB_STEP_SUMMARY"
