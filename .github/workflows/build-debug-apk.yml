@@ -1,0 +1,212 @@
+name: Build Debug APK
+
+on:
+  push:
+    branches: [ master, main ]
+  pull_request:
+    branches: [ master, main ]
+  workflow_dispatch:          # allows manual triggering from the Actions tab
+
+# Cancel any in-progress run on the same branch so pushes don't queue up
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  QNN_SDK_VERSION: "v2.28.0.241029"
+  QNN_SDK_URL: "https://apigwx-aws.qualcomm.com/qsc/public/v1/api/download/software/qualcomm_neural_processing_sdk/v2.28.0.241029.zip"
+  RUST_VERSION: "1.84.0"
+  NDK_VERSION: "r27c"
+  JAVA_VERSION: "17"
+
+jobs:
+  build:
+    name: Build Debug APK
+    runs-on: ubuntu-latest
+
+    steps:
+      # ── 1. Source ────────────────────────────────────────────────────────────
+      - name: Checkout repository (with submodules)
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 0
+
+      # ── 2. Java ──────────────────────────────────────────────────────────────
+      - name: Set up JDK ${{ env.JAVA_VERSION }}
+        uses: actions/setup-java@v4
+        with:
+          java-version: ${{ env.JAVA_VERSION }}
+          distribution: temurin
+          cache: gradle
+
+      # ── 3. Rust ──────────────────────────────────────────────────────────────
+      - name: Set up Rust ${{ env.RUST_VERSION }}
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+          targets: aarch64-linux-android
+
+      - name: Cache Rust build artifacts
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target/
+          key: ${{ runner.os }}-rust-${{ env.RUST_VERSION }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-rust-${{ env.RUST_VERSION }}-
+
+      # ── 4. System build tools ────────────────────────────────────────────────
+      - name: Install system dependencies (CMake, Ninja, unzip)
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            ninja-build \
+            cmake \
+            unzip \
+            wget
+
+      # ── 5. Android NDK ───────────────────────────────────────────────────────
+      - name: Set up Android NDK ${{ env.NDK_VERSION }}
+        id: setup-ndk
+        uses: nttld/setup-ndk@v1
+        with:
+          ndk-version: ${{ env.NDK_VERSION }}
+          local-cache: true
+
+      # ── 6. QNN SDK ───────────────────────────────────────────────────────────
+      - name: Cache QNN SDK
+        id: cache-qnn
+        uses: actions/cache@v4
+        with:
+          path: ${{ github.workspace }}/qnn_sdk
+          key: qnn-sdk-${{ env.QNN_SDK_VERSION }}
+
+      - name: Download and extract QNN SDK
+        if: steps.cache-qnn.outputs.cache-hit != 'true'
+        run: |
+          echo "Downloading QNN SDK ${{ env.QNN_SDK_VERSION }} ..."
+          wget --no-verbose \
+               --tries=3 \
+               --timeout=120 \
+               "${{ env.QNN_SDK_URL }}" \
+               -O qnn_sdk.zip
+
+          echo "Extracting QNN SDK ..."
+          mkdir -p qnn_sdk
+          unzip -q qnn_sdk.zip -d qnn_sdk
+          rm -f qnn_sdk.zip
+
+      - name: Resolve QNN SDK root directory
+        run: |
+          # The zip may contain a top-level versioned folder; resolve the real root
+          # by looking for the directory that contains 'lib' or 'include'
+          QNN_ROOT=$(find "${{ github.workspace }}/qnn_sdk" \
+                     -maxdepth 3 \
+                     \( -name "lib" -o -name "include" \) \
+                     -type d \
+                     | head -1 | xargs dirname)
+
+          if [ -z "$QNN_ROOT" ]; then
+            echo "ERROR: Could not determine QNN SDK root. Directory listing:"
+            find "${{ github.workspace }}/qnn_sdk" -maxdepth 3
+            exit 1
+          fi
+
+          echo "Resolved QNN SDK root: $QNN_ROOT"
+          echo "QNN_SDK_ROOT=$QNN_ROOT" >> "$GITHUB_ENV"
+
+      # ── 7. Patch build config files ──────────────────────────────────────────
+      - name: Patch QNN_SDK_ROOT in CMakeLists.txt
+        run: |
+          CMAKE_FILE="app/src/main/cpp/CMakeLists.txt"
+          NDK_PATH="${{ steps.setup-ndk.outputs.ndk-path }}"
+
+          echo "--- before patch (QNN_SDK_ROOT lines) ---"
+          grep -n "QNN_SDK_ROOT" "$CMAKE_FILE" || true
+
+          # Replace any existing set(QNN_SDK_ROOT ...) value
+          sed -i \
+            "s|set(QNN_SDK_ROOT[[:space:]]*\"[^\"]*\")|set(QNN_SDK_ROOT \"${{ env.QNN_SDK_ROOT }}\")|g" \
+            "$CMAKE_FILE"
+
+          # Fallback: if the line uses a bare path without quotes
+          sed -i \
+            "s|set(QNN_SDK_ROOT[[:space:]]*[^)]*)|set(QNN_SDK_ROOT \"${{ env.QNN_SDK_ROOT }}\")|g" \
+            "$CMAKE_FILE"
+
+          echo "--- after patch ---"
+          grep -n "QNN_SDK_ROOT" "$CMAKE_FILE" || true
+
+      - name: Patch ANDROID_NDK_ROOT in CMakePresets.json
+        run: |
+          PRESETS_FILE="app/src/main/cpp/CMakePresets.json"
+          NDK_PATH="${{ steps.setup-ndk.outputs.ndk-path }}"
+
+          echo "--- before patch (ANDROID_NDK_ROOT lines) ---"
+          grep -n "ANDROID_NDK_ROOT" "$PRESETS_FILE" || true
+
+          # Replace the NDK path (handles both quoted-value and path formats)
+          sed -i \
+            "s|\"ANDROID_NDK_ROOT\":[[:space:]]*\"[^\"]*\"|\"ANDROID_NDK_ROOT\": \"${NDK_PATH}\"|g" \
+            "$PRESETS_FILE"
+
+          echo "--- after patch ---"
+          grep -n "ANDROID_NDK_ROOT" "$PRESETS_FILE" || true
+
+      # ── 8. Build native C++ libraries ────────────────────────────────────────
+      - name: Build native libraries (build.sh)
+        working-directory: app/src/main/cpp
+        run: |
+          chmod +x build.sh
+          bash ./build.sh
+
+      # ── 9. Gradle – build debug APK ──────────────────────────────────────────
+      - name: Grant Gradle wrapper execute permission
+        run: chmod +x gradlew
+
+      - name: Build Debug APK
+        run: |
+          ./gradlew assembleDebug \
+            --no-daemon \
+            --stacktrace \
+            -Dorg.gradle.jvmargs="-Xmx4g -XX:MaxMetaspaceSize=512m"
+
+      # ── 10. Collect and upload artifacts ─────────────────────────────────────
+      - name: Locate APK files
+        id: locate-apk
+        run: |
+          APK_DIR="app/build/outputs/apk/debug"
+          echo "APK files found:"
+          find "$APK_DIR" -name "*.apk" 2>/dev/null || echo "  (none)"
+          echo "apk_dir=$APK_DIR" >> "$GITHUB_OUTPUT"
+
+      - name: Upload Debug APK(s)
+        uses: actions/upload-artifact@v4
+        with:
+          name: local-dream-debug-${{ github.sha }}
+          path: ${{ steps.locate-apk.outputs.apk_dir }}/*.apk
+          if-no-files-found: error
+          retention-days: 30
+
+      # ── 11. (Optional) Print build summary ───────────────────────────────────
+      - name: Print build summary
+        if: always()
+        run: |
+          echo "## Build Summary" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Property | Value |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| --- | --- |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Commit | \`${{ github.sha }}\` |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Branch | \`${{ github.ref_name }}\` |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| QNN SDK | \`${{ env.QNN_SDK_VERSION }}\` |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| NDK | \`${{ env.NDK_VERSION }}\` |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Rust | \`${{ env.RUST_VERSION }}\` |" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "### APK outputs" >> "$GITHUB_STEP_SUMMARY"
+          find app/build/outputs/apk -name "*.apk" 2>/dev/null \
+            | while read f; do
+                size=$(du -h "$f" | cut -f1)
+                echo "- \`$(basename $f)\` ($size)" >> "$GITHUB_STEP_SUMMARY"
+              done || echo "_No APKs found_" >> "$GITHUB_STEP_SUMMARY"
