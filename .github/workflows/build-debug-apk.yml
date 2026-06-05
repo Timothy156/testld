@@ -12,9 +12,20 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  QNN_SDK_VERSION: "v2.28.0.241029"
-  QNN_SDK_URL: "https://apigwx-aws.qualcomm.com/qsc/public/v1/api/download/software/qualcomm_neural_processing_sdk/v2.28.0.241029.zip"
-  # Pinned to 3.28.x — CMake 3.31 introduced CMP0175 which breaks tokenizers-cpp
+  # ── QNN SDK ──────────────────────────────────────────────────────────────────
+  # v2.28 (qualcomm_neural_processing_sdk) used a flat SampleApp layout and
+  # omitted the per-Hexagon-version stub libs. The current CMakeLists.txt
+  # expects the v2.39 (Qualcomm_AI_Runtime_Community) layout that ships:
+  #   examples/QNN/SampleApp/SampleApp/   ← nested subfolder
+  #   lib/aarch64-android/libQnnHtpV81Stub.so
+  #   lib/hexagon-v81/unsigned/libQnnHtpV81*.so
+  QNN_SDK_VERSION: "v2.39.0.250926"
+  QNN_SDK_URL: "https://apigwx-aws.qualcomm.com/qsc/public/v1/api/download/software/sdks/Qualcomm_AI_Runtime_Community/All/2.39.0.250926/v2.39.0.250926.zip"
+
+  # ── Toolchain ────────────────────────────────────────────────────────────────
+  # Pinned to 3.28.x — CMake 3.31 introduced CMP0175 which turns the
+  # POST_BUILD keyword inside add_custom_command(OUTPUT …) from a warning into
+  # an error, breaking tokenizers-cpp/msgpack.
   CMAKE_PINNED_VERSION: "3.28.6"
   RUST_VERSION: "1.84.0"
   JAVA_VERSION: "17"
@@ -59,19 +70,12 @@ jobs:
             ${{ runner.os }}-rust-${{ env.RUST_VERSION }}-
 
       # ── 4. System build tools ──────────────────────────────────────────────
-      - name: Install system dependencies (Ninja, unzip, dos2unix)
+      - name: Install system dependencies
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y --no-install-recommends \
-            ninja-build \
-            unzip \
-            wget \
-            dos2unix \
-            python3
+            ninja-build unzip wget dos2unix python3
 
-      # CMake 3.31+ introduced CMP0175 which breaks tokenizers-cpp's use of
-      # POST_BUILD inside add_custom_command(OUTPUT …). We pin to 3.28.x which
-      # predates that policy entirely.
       - name: Install pinned CMake ${{ env.CMAKE_PINNED_VERSION }}
         run: |
           CMAKE_VER="${{ env.CMAKE_PINNED_VERSION }}"
@@ -85,56 +89,49 @@ jobs:
         run: cmake --version
 
       # ── 5. Android NDK ────────────────────────────────────────────────────
-      # We do NOT use nttld/setup-ndk because actions/cache does not reliably
-      # restore dangling symlinks on cache hits — the clang → clang-18 symlink
-      # inside the NDK's llvm/prebuilt/linux-x86_64/bin/ disappears, making
+      # We do NOT use nttld/setup-ndk: its actions/cache restore step doesn't
+      # reliably preserve dangling symlinks (clang → clang-N), which makes
       # cmake report "compiler is not a full path to an existing tool".
       #
-      # Strategy (fastest to slowest):
-      #   1. Use the NDK already pre-installed on the ubuntu-latest runner
-      #      (GitHub ships NDK 27.x under $ANDROID_SDK_ROOT/ndk/).
-      #   2. If none is found or clang is missing, download directly from
-      #      Google's CDN (zip → extracted in-place, symlinks always intact).
+      # Instead we use the NDK already pre-installed on the ubuntu-latest
+      # runner ($ANDROID_SDK_ROOT/ndk/), and fall back to a direct Google
+      # download only if none is present or clang is missing.
       - name: Locate or download Android NDK
         id: ndk
         run: |
           CLANG_REL="toolchains/llvm/prebuilt/linux-x86_64/bin/clang"
-
-          # ── attempt 1: runner pre-installed NDK ──
           SDK_ROOT="${ANDROID_SDK_ROOT:-/usr/local/lib/android/sdk}"
           NDK_ROOT=""
+
+          # ── attempt 1: runner pre-installed NDK ──────────────────────────
           if [ -d "$SDK_ROOT/ndk" ]; then
-            # Pick the highest installed version
             NDK_ROOT=$(ls -d "$SDK_ROOT/ndk"/* 2>/dev/null | sort -V | tail -1)
           fi
 
           if [ -n "$NDK_ROOT" ] && [ -f "$NDK_ROOT/$CLANG_REL" ]; then
             echo "Using pre-installed NDK: $NDK_ROOT"
           else
-            echo "Pre-installed NDK not usable (missing or clang symlink absent)."
-            echo "Downloading NDK r27c directly from Google..."
-
-            NDK_ZIP_URL="https://dl.google.com/android/repository/android-ndk-r27c-linux.zip"
+            echo "Pre-installed NDK not usable — downloading r27c from Google..."
             DEST="$HOME/android-ndk-dl"
             mkdir -p "$DEST"
-            wget -q --tries=3 --timeout=180 "$NDK_ZIP_URL" -O /tmp/android-ndk.zip
+            wget -q --tries=3 --timeout=180 \
+              "https://dl.google.com/android/repository/android-ndk-r27c-linux.zip" \
+              -O /tmp/android-ndk.zip
             unzip -q /tmp/android-ndk.zip -d "$DEST"
             rm /tmp/android-ndk.zip
             NDK_ROOT=$(find "$DEST" -maxdepth 1 -mindepth 1 -type d | head -1)
-            echo "Extracted to: $NDK_ROOT"
           fi
 
-          # ── sanity check ──
+          # ── verify ───────────────────────────────────────────────────────
           if [ ! -f "$NDK_ROOT/$CLANG_REL" ]; then
-            echo "ERROR: clang still not found after setup. Listing bin/:"
+            echo "ERROR: clang not found after setup. bin/ contents:"
             ls "$NDK_ROOT/toolchains/llvm/prebuilt/linux-x86_64/bin/" | grep -i clang || true
             exit 1
           fi
-
           echo "NDK clang OK: $NDK_ROOT/$CLANG_REL"
-          echo "ndk_root=$NDK_ROOT" >> "$GITHUB_OUTPUT"
-          echo "ANDROID_NDK_ROOT=$NDK_ROOT" >> "$GITHUB_ENV"
-          echo "ANDROID_NDK=$NDK_ROOT"      >> "$GITHUB_ENV"
+          echo "ndk_root=$NDK_ROOT"          >> "$GITHUB_OUTPUT"
+          echo "ANDROID_NDK_ROOT=$NDK_ROOT"  >> "$GITHUB_ENV"
+          echo "ANDROID_NDK=$NDK_ROOT"       >> "$GITHUB_ENV"
 
       # ── 6. QNN SDK ────────────────────────────────────────────────────────
       - name: Cache QNN SDK
@@ -148,29 +145,57 @@ jobs:
         if: steps.cache-qnn.outputs.cache-hit != 'true'
         run: |
           echo "Downloading QNN SDK ${{ env.QNN_SDK_VERSION }} ..."
-          wget --no-verbose --tries=3 --timeout=120 \
+          wget --no-verbose --tries=3 --timeout=180 \
                "${{ env.QNN_SDK_URL }}" -O qnn_sdk.zip
           mkdir -p qnn_sdk
           unzip -q qnn_sdk.zip -d qnn_sdk
           rm -f qnn_sdk.zip
 
-      - name: Resolve QNN SDK root directory
+      - name: Resolve QNN SDK root and validate required paths
         run: |
+          # Walk the tree to find the directory that owns 'lib' and 'include'
           QNN_ROOT=$(find "${{ github.workspace }}/qnn_sdk" \
-                     -maxdepth 4 \
-                     \( -name "lib" -o -name "include" \) \
-                     -type d | head -1 | xargs dirname 2>/dev/null || true)
+                     -maxdepth 5 \
+                     -type d -name "include" \
+                     | xargs -I{} dirname {} \
+                     | while read d; do
+                         [ -d "$d/lib" ] && echo "$d" && break
+                       done)
 
           if [ -z "$QNN_ROOT" ]; then
-            echo "ERROR: Could not determine QNN SDK root. Listing tree:"
-            find "${{ github.workspace }}/qnn_sdk" -maxdepth 4 | head -60
+            echo "ERROR: Cannot resolve QNN SDK root. Dumping tree:"
+            find "${{ github.workspace }}/qnn_sdk" -maxdepth 5 | head -80
             exit 1
           fi
           echo "QNN SDK root: $QNN_ROOT"
           echo "QNN_SDK_ROOT=$QNN_ROOT" >> "$GITHUB_ENV"
 
+          # ── Validate the three paths that CMakeLists.txt hard-requires ────
+          MISSING=0
+          check() {
+            if [ ! -e "$QNN_ROOT/$1" ]; then
+              echo "MISSING: $QNN_ROOT/$1"
+              MISSING=1
+            else
+              echo "OK:      $QNN_ROOT/$1"
+            fi
+          }
+          check "examples/QNN/SampleApp/SampleApp"
+          check "lib/aarch64-android/libQnnHtpV81Stub.so"
+          check "lib/hexagon-v81/unsigned/libQnnHtpV81.so"
+          check "lib/hexagon-v81/unsigned/libQnnHtpV81Skel.so"
+
+          if [ "$MISSING" = "1" ]; then
+            echo ""
+            echo "One or more required SDK paths are missing."
+            echo "Showing actual SDK tree (lib/ and examples/):"
+            find "$QNN_ROOT/lib"      -maxdepth 3 | sort | head -60 || true
+            find "$QNN_ROOT/examples" -maxdepth 4 | sort | head -40 || true
+            exit 1
+          fi
+
       # ── 7. Patch config files ──────────────────────────────────────────────
-      - name: Patch QNN_SDK_ROOT and ANDROID_NDK_ROOT into config files (Python)
+      - name: Patch QNN_SDK_ROOT and ANDROID_NDK_ROOT into config files
         run: |
           python3 - << 'PYEOF'
           import re, pathlib, os, sys
@@ -189,7 +214,8 @@ jobs:
               )
               cmake_file.write_text(text)
               changed = text != original
-              print(f"CMakeLists.txt: {'patched OK' if changed else 'WARNING — pattern not found, check manually'}")
+              status = "patched OK" if changed else "WARNING — pattern not found, check manually"
+              print(f"CMakeLists.txt: {status}")
               for i, line in enumerate(text.splitlines(), 1):
                   if "QNN_SDK_ROOT" in line:
                       print(f"  line {i}: {line.strip()}")
@@ -207,7 +233,8 @@ jobs:
               )
               presets_file.write_text(text)
               changed = text != original
-              print(f"CMakePresets.json: {'patched OK' if changed else 'WARNING — pattern not found, check manually'}")
+              status = "patched OK" if changed else "WARNING — pattern not found, check manually"
+              print(f"CMakePresets.json: {status}")
               for i, line in enumerate(text.splitlines(), 1):
                   if "ANDROID_NDK_ROOT" in line:
                       print(f"  line {i}: {line.strip()}")
@@ -215,12 +242,11 @@ jobs:
               print("WARNING: CMakePresets.json not found", file=sys.stderr)
           PYEOF
 
-      # ── 8. Patch build.sh for cmake policy compatibility ───────────────────
+      # ── 8. Patch build.sh for cmake compatibility ──────────────────────────
       - name: Patch build.sh for cmake policy compatibility
         run: |
           BUILD_SH="app/src/main/cpp/build.sh"
           if [ -f "$BUILD_SH" ]; then
-            # Mirror the macOS workaround from the README (Linux sed, no trailing '')
             sed -i 's/cmake \([^-]\)/cmake -DCMAKE_POLICY_VERSION_MINIMUM=3.5 \1/g' "$BUILD_SH"
             echo "cmake invocations after patch:"
             grep "cmake " "$BUILD_SH" | head -10
@@ -230,9 +256,9 @@ jobs:
       - name: Build native libraries (build.sh)
         working-directory: app/src/main/cpp
         env:
-          QNN_SDK_ROOT:      ${{ env.QNN_SDK_ROOT }}
-          ANDROID_NDK_ROOT:  ${{ env.ANDROID_NDK_ROOT }}
-          ANDROID_NDK:       ${{ env.ANDROID_NDK_ROOT }}
+          QNN_SDK_ROOT:     ${{ env.QNN_SDK_ROOT }}
+          ANDROID_NDK_ROOT: ${{ env.ANDROID_NDK_ROOT }}
+          ANDROID_NDK:      ${{ env.ANDROID_NDK_ROOT }}
         run: |
           chmod +x build.sh
           bash ./build.sh
